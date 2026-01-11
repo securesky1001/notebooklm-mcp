@@ -15,6 +15,11 @@ from typing import Any
 import httpx
 
 
+class AuthenticationError(Exception):
+    """Raised when authentication fails (HTTP 401/403 or RPC Error 16)."""
+    pass
+
+
 # Ownership constants (from metadata position 0)
 OWNERSHIP_MINE = 1
 OWNERSHIP_SHARED = 2
@@ -30,6 +35,7 @@ class ConversationTurn:
     query: str       # The user's question
     answer: str      # The AI's response
     turn_number: int  # 1-indexed turn number in the conversation
+
 
 
 def parse_timestamp(ts_array: list | None) -> str | None:
@@ -153,6 +159,7 @@ class NotebookLMClient:
     RPC_GENERATE_MIND_MAP = "yyryJe"  # Generate mind map JSON from sources
     RPC_SAVE_MIND_MAP = "CYK0Xb"      # Save generated mind map to notebook
     RPC_LIST_MIND_MAPS = "cFji9"       # List existing mind maps
+    RPC_DELETE_MIND_MAP = "AH0mwd"     # Delete a mind map
 
     # Report format constants
     REPORT_FORMAT_BRIEFING_DOC = "Briefing Doc"
@@ -365,7 +372,7 @@ class NotebookLMClient:
         params = {
             "rpcids": rpc_id,
             "source-path": source_path,
-            "bl": os.environ.get("NOTEBOOKLM_BL", "boq_labs-tailwind-frontend_20251221.14_p0"),
+            "bl": os.environ.get("NOTEBOOKLM_BL", "boq_labs-tailwind-frontend_20260108.06_p0"),
             "hl": "en",
             "rt": "c",
         }
@@ -429,6 +436,11 @@ class NotebookLMClient:
                 for item in chunk:
                     if isinstance(item, list) and len(item) >= 3:
                         if item[0] == "wrb.fr" and item[1] == rpc_id:
+                            # Check for generic error signature (e.g. auth expired)
+                            # Signature: ["wrb.fr", "RPC_ID", null, null, null, [16], "generic"]
+                            if len(item) > 6 and item[6] == "generic" and isinstance(item[5], list) and 16 in item[5]:
+                                raise AuthenticationError("RPC Error 16: Authentication expired")
+
                             result_str = item[2]
                             if isinstance(result_str, str):
                                 try:
@@ -444,18 +456,41 @@ class NotebookLMClient:
         params: Any,
         path: str = "/",
         timeout: float | None = None,
+        _retry: bool = False,
     ) -> Any:
-        """Execute an RPC call and return the extracted result."""
+        """Execute an RPC call and return the extracted result.
+
+        Includes automatic retry on auth failures (401/403). If the first attempt
+        fails with an auth error, refreshes CSRF/session tokens and retries once.
+        """
         client = self._get_client()
         body = self._build_request_body(rpc_id, params)
         url = self._build_url(rpc_id, path)
-        if timeout:
-            response = client.post(url, content=body, timeout=timeout)
-        else:
-            response = client.post(url, content=body)
-        response.raise_for_status()
-        parsed = self._parse_response(response.text)
-        return self._extract_rpc_result(parsed, rpc_id)
+
+        try:
+            if timeout:
+                response = client.post(url, content=body, timeout=timeout)
+            else:
+                response = client.post(url, content=body)
+            response.raise_for_status()
+            
+            # Check for RPC-level errors (soft auth failure)
+            parsed = self._parse_response(response.text)
+            return self._extract_rpc_result(parsed, rpc_id)
+
+        except (httpx.HTTPStatusError, AuthenticationError) as e:
+            # Check for auth failures (401/403 HTTP or RPC Error 16)
+            is_http_auth = isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (401, 403)
+            is_rpc_auth = isinstance(e, AuthenticationError)
+            
+            if (is_http_auth or is_rpc_auth) and not _retry:
+                # Token likely expired - refresh and retry once
+                self._refresh_auth_tokens()
+                # Reset client to pick up new tokens in headers
+                self._client = None
+                return self._call_rpc(rpc_id, params, path, timeout, _retry=True)
+            # Re-raise if already retried or different error
+            raise
 
     # =========================================================================
     # Conversation Management (for query follow-ups)
@@ -1226,7 +1261,7 @@ class NotebookLMClient:
 
         self._reqid_counter += 100000  # Increment counter
         url_params = {
-            "bl": os.environ.get("NOTEBOOKLM_BL", "boq_labs-tailwind-frontend_20251221.14_p0"),
+            "bl": os.environ.get("NOTEBOOKLM_BL", "boq_labs-tailwind-frontend_20260108.06_p0"),
             "hl": "en",
             "_reqid": str(self._reqid_counter),
             "rt": "c",
@@ -1984,31 +2019,74 @@ class NotebookLMClient:
 
         return artifacts
 
-    def delete_studio_artifact(self, artifact_id: str) -> bool:
-        """Delete a studio artifact (Audio or Video Overview).
+    def delete_studio_artifact(self, artifact_id: str, notebook_id: str | None = None) -> bool:
+        """Delete a studio artifact (Audio, Video, or Mind Map).
 
         WARNING: This action is IRREVERSIBLE. The artifact will be permanently deleted.
 
         Args:
             artifact_id: The artifact UUID to delete
+            notebook_id: Optional notebook ID. Required for deleting Mind Maps.
 
         Returns:
             True on success, False on failure
         """
-        client = self._get_client()
+        # 1. Try standard deletion (Audio, Video, etc.)
+        try:
+            params = [[2], artifact_id]
+            result = self._call_rpc(self.RPC_DELETE_STUDIO, params)
+            if result is not None:
+                return True
+        except Exception:
+            # Continue to fallback if standard delete fails
+            pass
 
-        # Delete studio artifact params: [[2], "artifact_id"]
-        params = [[2], artifact_id]
-        body = self._build_request_body(self.RPC_DELETE_STUDIO, params)
-        url = self._build_url(self.RPC_DELETE_STUDIO)
+        # 2. Fallback: Try Mind Map deletion if we have a notebook ID
+        # Mind maps require a different RPC (AH0mwd) and payload structure
+        if notebook_id:
+            return self.delete_mind_map(notebook_id, artifact_id)
 
-        response = client.post(url, content=body)
-        response.raise_for_status()
+        return False
 
-        parsed = self._parse_response(response.text)
-        result = self._extract_rpc_result(parsed, self.RPC_DELETE_STUDIO)
+    def delete_mind_map(self, notebook_id: str, mind_map_id: str) -> bool:
+        """Delete a Mind Map artifact using the observed two-step RPC sequence.
 
-        return result is not None
+        Args:
+            notebook_id: The notebook UUID.
+            mind_map_id: The Mind Map artifact UUID.
+
+        Returns:
+            True on success
+        """
+        # 1. We need the artifact-specific timestamp from LIST_MIND_MAPS
+        params = [notebook_id]
+        list_result = self._call_rpc(
+            self.RPC_LIST_MIND_MAPS, params, f"/notebook/{notebook_id}"
+        )
+
+        timestamp = None
+        if list_result and isinstance(list_result, list) and len(list_result) > 0:
+            mm_list = list_result[0] if isinstance(list_result[0], list) else []
+            for mm_entry in mm_list:
+                if isinstance(mm_entry, list) and mm_entry[0] == mind_map_id:
+                    # Based on debug output: item[1][2][2] contains [seconds, micros]
+                    try:
+                        timestamp = mm_entry[1][2][2]
+                    except (IndexError, TypeError):
+                        pass
+                    break
+
+        # 2. Step 1: UUID-based deletion (AH0mwd)
+        params_v2 = [notebook_id, None, [mind_map_id], [2]]
+        self._call_rpc(self.RPC_DELETE_MIND_MAP, params_v2, f"/notebook/{notebook_id}")
+
+        # 3. Step 2: Timestamp-based sync/deletion (cFji9)
+        # This is required to fully remove it from the list and avoid "ghosts"
+        if timestamp:
+            params_v1 = [notebook_id, None, timestamp, [2]]
+            self._call_rpc(self.RPC_LIST_MIND_MAPS, params_v1, f"/notebook/{notebook_id}")
+
+        return True
 
     def create_infographic(
         self,
@@ -2579,11 +2657,17 @@ class NotebookLMClient:
             mind_map_list = result[0] if isinstance(result[0], list) else []
 
             for mind_map_data in mind_map_list:
+                # Skip invalid or tombstone entries (deleted entries have details=None)
+                # Tombstone format: [uuid, null, 2]
                 if not isinstance(mind_map_data, list) or len(mind_map_data) < 2:
+                    continue
+                
+                details = mind_map_data[1]
+                if details is None:
+                    # This is a tombstone/deleted entry, skip it
                     continue
 
                 mind_map_id = mind_map_data[0]
-                details = mind_map_data[1] if len(mind_map_data) > 1 else []
 
                 if isinstance(details, list) and len(details) >= 5:
                     # Details: [id, json, metadata, null, title]

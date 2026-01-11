@@ -1119,9 +1119,24 @@ def studio_status(notebook_id: str) -> dict[str, Any]:
         client = get_client()
         artifacts = client.poll_studio_status(notebook_id)
 
+        # Also fetch mind maps and add them as artifacts
+        try:
+            mind_maps = client.list_mind_maps(notebook_id)
+            for mm in mind_maps:
+                artifacts.append({
+                    "artifact_id": mm.get("mind_map_id"),
+                    "type": "mind_map",
+                    "title": mm.get("title", "Mind Map"),
+                    "status": "completed",
+                    "created_at": mm.get("created_at"),
+                })
+        except Exception:
+            # Don't fail studio_status if mind maps fail
+            pass
+
         # Separate by status
-        completed = [a for a in artifacts if a["status"] == "completed"]
-        in_progress = [a for a in artifacts if a["status"] == "in_progress"]
+        completed = [a for a in artifacts if a.get("status") == "completed"]
+        in_progress = [a for a in artifacts if a.get("status") == "in_progress"]
 
         return {
             "status": "success",
@@ -1162,7 +1177,7 @@ def studio_delete(
 
     try:
         client = get_client()
-        result = client.delete_studio_artifact(artifact_id)
+        result = client.delete_studio_artifact(artifact_id, notebook_id)
 
         if result:
             return {
